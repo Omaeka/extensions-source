@@ -1,223 +1,179 @@
 package eu.kanade.tachiyomi.extension.es.olympusscanlation
 
-import android.content.SharedPreferences
-import androidx.preference.PreferenceScreen
-import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.source.ConfigurableSource
-import eu.kanade.tachiyomi.source.model.FilterList
-import eu.kanade.tachiyomi.source.model.MangasPage
-import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import keiyoushi.annotation.Source
-import keiyoushi.network.get
-import keiyoushi.network.rateLimit
-import keiyoushi.source.KeiSource
-import keiyoushi.utils.asJsoup
-import keiyoushi.utils.getPreferences
-import keiyoushi.utils.parseAs
-import keiyoushi.utils.toJsonString
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.serialization.SerializationException
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.OkHttpClient
-import kotlin.time.Duration.Companion.seconds
+import keiyoushi.utils.tryParse
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlin.time.Instant
 
-@Source
-abstract class OlympusScanlation :
-    KeiSource(),
-    ConfigurableSource {
+@Serializable
+class RankingDto(
+    val data: List<MangaDto>,
+    @SerialName("current_page") private val currentPage: Int,
+    @SerialName("last_page") private val lastPage: Int,
+) {
+    fun hasNextPage() = currentPage < lastPage
+}
 
-    private fun fetchedDomainUrl() {
-        if (!preferences.fetchDomainPref()) return
-        try {
-            val initClient = network.client
-            val document = initClient.newCall(GET("https://olympus.pages.dev", headers)).execute().asJsoup()
-            val domain = document.selectFirst("meta[property=og:url]")?.attr("content")
-                ?: return
-            val host = initClient.newCall(GET(domain, headers)).execute().request.url.host
-            val newDomain = "https://$host"
-            preferences.edit().putString(BASE_URL_PREF, newDomain).apply()
-        } catch (_: Exception) {
-            return
+// GET /api/homepage  (rankings = top de series, data.new_chapters = últimos capítulos)
+@Serializable
+class HomepageDto(
+    val data: HomepageDataDto,
+    val rankings: List<MangaDto> = emptyList(),
+)
+
+@Serializable
+class HomepageDataDto(
+    @SerialName("new_chapters") val newChapters: List<LatestMangaDto> = emptyList(),
+)
+
+@Serializable
+class PayloadSeriesDto(val data: PayloadSeriesDataDto)
+
+@Serializable
+class PayloadSeriesDataDto(
+    val series: SeriesDto,
+)
+
+@Serializable
+class SeriesDto(
+    val data: List<MangaDto>,
+    @SerialName("current_page") private val currentPage: Int,
+    @SerialName("last_page") private val lastPage: Int,
+) {
+    fun hasNextPage() = currentPage < lastPage
+}
+
+@Serializable
+class PayloadMangaDto(val data: List<MangaDto>)
+
+@Serializable
+class MangaDto(
+    val id: Int,
+    val name: String,
+    val slug: String,
+    private val cover: String? = null,
+    val type: String? = null,
+    private val summary: String? = null,
+    private val status: MangaStatusDto? = null,
+    private val genres: List<FilterDto>? = null,
+) {
+    fun toSManga() = SManga.create().apply {
+        title = name
+        url = id.toString()
+        thumbnail_url = cover
+    }
+
+    fun toSMangaDetails() = toSManga().apply {
+        description = summary
+        status = parseStatus()
+        genre = genres?.joinToString { it.name.trim() }
+    }
+
+    private fun parseStatus(): Int {
+        val status = this.status ?: return SManga.UNKNOWN
+        return when (status.id) {
+            1 -> SManga.ONGOING
+            3 -> SManga.ON_HIATUS
+            4 -> SManga.COMPLETED
+            5 -> SManga.CANCELLED
+            else -> SManga.UNKNOWN
         }
     }
+}
 
-    private val apiBaseUrl get() = baseUrl.replace("https://", "https://panel.")
+@Serializable
+class NewChaptersDto(
+    val data: List<LatestMangaDto>,
+    @SerialName("current_page") private val currentPage: Int,
+    @SerialName("last_page") private val lastPage: Int,
+) {
+    fun hasNextPage() = currentPage < lastPage
+}
 
-    private val preferences = getPreferences()
-
-    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder {
-        fetchedDomainUrl()
-        return rateLimit(1, 2.seconds) { it.host == baseUrl.toHttpUrl().host }
-            .rateLimit(2, 1.seconds) { it.host == apiBaseUrl.toHttpUrl().host }
+@Serializable
+class LatestMangaDto(
+    val id: Int,
+    private val name: String,
+    val slug: String,
+    private val cover: String? = null,
+    val type: String? = null,
+) {
+    fun toSManga() = SManga.create().apply {
+        title = name
+        url = id.toString()
+        thumbnail_url = cover
     }
+}
 
-    private var seriesList: List<MangaDto> = emptyList()
+@Serializable
+class MangaDetailDto(
+    var data: MangaDto,
+)
 
-    private var lastFetchTime: Long = 0L
+@Serializable
+class PayloadChapterDto(var data: List<ChapterDto>, val meta: MetaDto)
 
-    private val seriesListMutex = Mutex()
-
-    private suspend fun fetchSeriesList() = seriesListMutex.withLock {
-        val now = System.currentTimeMillis()
-
-        if (seriesList.isNotEmpty() && (now - lastFetchTime) < CACHE_DURATION_MS) {
-            return@withLock
-        }
-
-        val series = client.get("$baseUrl/api/series/list").parseAs<PayloadMangaDto>()
-
-        val comics = series.data.asSequence()
-            .filter { it.type == "comic" }
-            .toList()
-
-        seriesList = comics
-        lastFetchTime = now
-
-        val newSlugMap = comics.associate { it.id to it.slug }
-
-        preferences.slugMap += newSlugMap
+@Serializable
+class ChapterDto(
+    val id: Int,
+    private val name: String,
+    @SerialName("published_at") private val date: String,
+) {
+    // url = "{idSerie}/{número de capítulo}": la API de páginas pide el número, no el id
+    fun toSChapter(mangaId: String) = SChapter.create().apply {
+        name = "Capitulo ${this@ChapterDto.name}"
+        url = "$mangaId/${this@ChapterDto.name}"
+        date_upload = Instant.tryParse(date)
     }
+}
 
-    override suspend fun getPopularManga(page: Int): MangasPage {
-        fetchSeriesList()
-        val result = client.get("$baseUrl/api/rankings?page=$page&period=total_ranking").parseAs<RankingDto>()
-        val slugMap = preferences.slugMap.toMutableMap()
-        val mangaList = result.data
-            .filter { it.type == "comic" }
-            .map {
-                slugMap[it.id] = it.slug
-                it.toSManga()
-            }
-        preferences.slugMap = slugMap
-        return MangasPage(mangaList, hasNextPage = result.hasNextPage())
-    }
+@Serializable
+class MetaDto(val total: Int)
 
-    override suspend fun getLatestUpdates(page: Int): MangasPage {
-        fetchSeriesList()
-        val result = client.get("$baseUrl/api/new-chapters?page=$page").parseAs<NewChaptersDto>()
-        val slugMap = preferences.slugMap.toMutableMap()
-        val mangaList = result.data.filter { it.type == "comic" }
-            .map {
-                slugMap[it.id] = it.slug
-                it.toSManga()
-            }
-        preferences.slugMap = slugMap
-        return MangasPage(mangaList, result.hasNextPage())
-    }
+@Serializable
+class PayloadPagesDto(val chapter: PageDto)
 
-    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
-        fetchSeriesList()
-        val filteredList = seriesList.filter { it.name.contains(query, ignoreCase = true) }
-        val paginatedList = filteredList.drop((page - 1) * 20).take(20)
-        val hasNextPage = page * 20 < filteredList.size
-        return MangasPage(paginatedList.map { it.toSManga() }, hasNextPage)
-    }
+@Serializable
+class PageDto(val pages: List<String>)
 
-    override fun getMangaUrl(manga: SManga): String {
-        val slug = preferences.slugMap[manga.url.toInt()]!!
-        return "$baseUrl/series/comic-$slug"
-    }
+@Serializable
+class MangaStatusDto(
+    val id: Int,
+)
 
-    override suspend fun fetchMangaUpdate(
-        manga: SManga,
-        chapters: List<SChapter>,
-        fetchDetails: Boolean,
-        fetchChapters: Boolean,
-    ): SMangaUpdate {
-        fetchSeriesList()
-        val mangaId = manga.url
-        val slug = preferences.slugMap[mangaId.toInt()]!!
+@Serializable
+class GenresStatusesDto(
+    val genres: List<FilterDto>,
+    val statuses: List<FilterDto>,
+)
 
-        return coroutineScope {
-            val details = async {
-                if (fetchDetails) {
-                    client.get("$baseUrl/api/series/$slug?type=comic")
-                        .parseAs<MangaDetailDto>().data.toSMangaDetails()
-                } else {
-                    manga
-                }
-            }
-            val chapterList = async {
-                if (fetchChapters) fetchChapterList(slug, mangaId) else chapters
-            }
-            SMangaUpdate(details.await(), chapterList.await())
-        }
-    }
+@Serializable
+class FilterDto(
+    val id: Int,
+    val name: String,
+)
 
-    private suspend fun fetchChapterList(mangaSlug: String, mangaId: String): List<SChapter> {
-        val data = fetchChapterPage(mangaSlug, 1)
-        val result = data.data.toMutableList()
-        var page = 2
-        while (data.meta.total > result.size) {
-            val newData = fetchChapterPage(mangaSlug, page)
-            result += newData.data
-            page += 1
-        }
-        return result.map { it.toSChapter(mangaId) }
-    }
+@Serializable
+class BookmarksWrapperDto(
+    private val data: List<BookmarkDto> = emptyList(),
+    val meta: BookmarksMetaDto,
+) {
+    fun getBookmarks() = data.filter { it.type == "comic" && it.id != null && it.slug != null }
+}
 
-    private suspend fun fetchChapterPage(mangaSlug: String, page: Int): PayloadChapterDto = client.get("$apiBaseUrl/api/series/$mangaSlug/chapters?page=$page&direction=desc&type=comic")
-        .parseAs<PayloadChapterDto>()
+@Serializable
+class BookmarkDto(
+    val id: Int?,
+    val slug: String?,
+    val type: String?,
+)
 
-    override fun getChapterUrl(chapter: SChapter): String {
-        val mangaId = chapter.url.substringBefore("/")
-        val chapterId = chapter.url.substringAfter("/")
-        val mangaSlug = preferences.slugMap[mangaId.toInt()]!!
-        return "$baseUrl/capitulo/$chapterId/comic-$mangaSlug"
-    }
-
-    override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val mangaId = chapter.url.substringBefore("/")
-        val chapterId = chapter.url.substringAfter("/")
-        val mangaSlug = preferences.slugMap[mangaId.toInt()]!!
-
-        return client.get("$baseUrl/api/capitulo/comic-$mangaSlug/$chapterId")
-            .parseAs<PayloadPagesDto>().chapter.pages.mapIndexed { i, img ->
-                Page(i, imageUrl = img)
-            }
-    }
-
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        SwitchPreferenceCompat(screen.context).apply {
-            key = FETCH_DOMAIN_PREF
-            title = "Buscar dominio automáticamente"
-            summary = "Intenta buscar el dominio automáticamente al abrir la fuente."
-            setDefaultValue(true)
-        }.also { screen.addPreference(it) }
-    }
-
-    private fun SharedPreferences.fetchDomainPref() = getBoolean(FETCH_DOMAIN_PREF, true)
-
-    private var slugMapCache: Map<Int, String>? = null
-    private var SharedPreferences.slugMap: Map<Int, String>
-        get() {
-            slugMapCache?.let { return it }
-            val json = getString(SLUG_MAP, "{}")!!
-            slugMapCache = try {
-                json.parseAs<Map<Int, String>>()
-            } catch (_: SerializationException) {
-                emptyMap()
-            }
-            return slugMapCache!!
-        }
-        set(map) {
-            slugMapCache = map
-            edit().putString(SLUG_MAP, map.toJsonString()).apply()
-        }
-
-    companion object {
-        private const val BASE_URL_PREF = "overrideBaseUrl"
-        private const val FETCH_DOMAIN_PREF = "fetchDomain"
-
-        private const val SLUG_MAP = "slugMap"
-
-        private const val CACHE_DURATION_MS = 60 * 60 * 1000L // 1 hour
-    }
+@Serializable
+class BookmarksMetaDto(
+    @SerialName("current_page") private val currentPage: Int,
+    @SerialName("last_page") private val lastPage: Int,
+) {
+    fun hasNextPage() = currentPage < lastPage
 }
