@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Olympus Scanlation"
-    versionCode = 0
+    versionCode = 100
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 
