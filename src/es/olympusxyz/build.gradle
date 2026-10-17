@@ -1,0 +1,10 @@
+ext {
+    extName = 'Olympus Scanlation'
+    extClass = '.OlympusXyz'
+    extVersionCode = 1
+    isNsfw = false
+}
+
+apply plugin: 'kotlinx-serialization'
+
+apply from: "$rootDir/common.gradle"
