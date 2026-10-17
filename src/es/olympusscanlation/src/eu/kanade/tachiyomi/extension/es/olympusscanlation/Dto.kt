@@ -16,6 +16,18 @@ class RankingDto(
     fun hasNextPage() = currentPage < lastPage
 }
 
+// GET /api/homepage  (rankings = top de series, data.new_chapters = últimos capítulos)
+@Serializable
+class HomepageDto(
+    val data: HomepageDataDto,
+    val rankings: List<MangaDto> = emptyList(),
+)
+
+@Serializable
+class HomepageDataDto(
+    @SerialName("new_chapters") val newChapters: List<LatestMangaDto> = emptyList(),
+)
+
 @Serializable
 class PayloadSeriesDto(val data: PayloadSeriesDataDto)
 
@@ -105,13 +117,14 @@ class PayloadChapterDto(var data: List<ChapterDto>, val meta: MetaDto)
 
 @Serializable
 class ChapterDto(
-    private val id: Int,
+    val id: Int,
     private val name: String,
     @SerialName("published_at") private val date: String,
 ) {
+    // url = "{idSerie}/{número de capítulo}": la API de páginas pide el número, no el id
     fun toSChapter(mangaId: String) = SChapter.create().apply {
         name = "Capitulo ${this@ChapterDto.name}"
-        url = "$mangaId/$id"
+        url = "$mangaId/${this@ChapterDto.name}"
         date_upload = Instant.tryParse(date)
     }
 }
